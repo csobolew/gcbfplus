@@ -32,10 +32,10 @@ class Quadruped(MultiAgentEnv):
     EnvGraphsTuple = GraphsTuple[State, EnvState]
 
     PARAMS = {
-        "car_radius": 0.05,
-        "comm_radius": 0.5,
+        "car_radius": 0.55,
+        "comm_radius": 5.5,
         "n_rays": 32,
-        "obs_len_range": [0.1, 0.6],
+        "obs_len_range": [1.0, 2.0],
         "n_obs": 8,
     }
 
