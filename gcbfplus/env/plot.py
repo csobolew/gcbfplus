@@ -409,7 +409,7 @@ def render_video(
             cbar = fig.colorbar(cnt, ax=ax)
             cbar.add_lines(cnt_line)
             cbar.ax.tick_params(labelsize=36, labelfontfamily="Times New Roman")
-            print(cnt.collections)
+
             cnt_col = [*cnt.collections, *cnt_line.collections]
 
             ax.text(0.5, 1.0, "CBF for {}".format(cbf_num), transform=ax.transAxes, va="bottom")
