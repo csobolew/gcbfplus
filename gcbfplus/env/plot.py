@@ -9,7 +9,7 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.collections import LineCollection, PatchCollection
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.pyplot import Axes
-from matplotlib.patches import Polygon
+from matplotlib.patches import Polygon, FancyArrow
 from mpl_toolkits.mplot3d import proj3d, Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 from typing import List, Optional, Union
@@ -219,6 +219,10 @@ def render_video(
     if viz_opts is None:
         viz_opts = {}
 
+    # Check if we should show orientation
+    show_orientation = viz_opts.get('show_orientation', False)
+    arrow_length = viz_opts.get('arrow_length', r * 2.0)
+
     # plot the first frame
     T_graph = rollout.Tp1_graph
     graph0 = tree_index(T_graph, 0)
@@ -227,6 +231,7 @@ def render_video(
     goal_color = "#2fdd00"
     obs_color = "#8a0000"
     edge_goal_color = goal_color
+    arrow_color = "#ffffff"  # White arrows for visibility
 
     # plot obstacles
     obs = graph0.env_states.obstacle
@@ -237,15 +242,88 @@ def render_video(
     n_color = [agent_color] * n_agent + [goal_color] * n_agent
     n_pos = graph0.states[:n_agent * 2, :dim]
     n_radius = np.array([r] * n_agent * 2)
+    
     if dim == 2:
         agent_circs = [plt.Circle(n_pos[ii], n_radius[ii], color=n_color[ii], linewidth=0.0)
                        for ii in range(n_agent * 2)]
         agent_col = MutablePatchCollection([i for i in reversed(agent_circs)], match_original=True, zorder=6)
         ax.add_collection(agent_col)
+        
+        # Add orientation arrows for agents if state has orientation
+        orientation_arrows = []
+        goal_orientation_arrows = []
+        if show_orientation and graph0.states.shape[1] >= 3:
+            print(f"State shape: {graph0.states.shape}")
+            print(f"First few agent states: {graph0.states[:n_agent, :]}")
+            print(f"First few goal states: {graph0.states[n_agent:n_agent*2, :]}")
+            
+            # Agent orientation arrows
+            for ii in range(n_agent):
+                x, y = n_pos[ii, 0], n_pos[ii, 1]
+                psi = graph0.states[ii, 2]  # Get orientation
+                
+                print(f"Agent {ii}: pos=({x:.2f}, {y:.2f}), psi={psi:.2f} rad ({np.degrees(psi):.1f} deg)")
+                
+                # Arrow pointing from center in direction of psi
+                arrow_start_x = x - (arrow_length * 0.3) * np.cos(psi)
+                arrow_start_y = y - (arrow_length * 0.3) * np.sin(psi)
+                dx = arrow_length * np.cos(psi)
+                dy = arrow_length * np.sin(psi)
+                
+                # Create arrow
+                arrow = FancyArrow(
+                    arrow_start_x, arrow_start_y, dx, dy,
+                    width=r * 0.4,
+                    head_width=r * 1.2,
+                    head_length=r * 0.8,
+                    fc=arrow_color,
+                    ec='black',
+                    linewidth=1.0,
+                    zorder=9,
+                    length_includes_head=True
+                )
+                ax.add_patch(arrow)
+                orientation_arrows.append(arrow)
+            
+            # Goal orientation arrows
+            for ii in range(n_agent):
+                goal_idx = n_agent + ii
+                x, y = n_pos[goal_idx, 0], n_pos[goal_idx, 1]
+                psi = graph0.states[goal_idx, 2]  # Get goal orientation
+                
+                print(f"Goal {ii}: pos=({x:.2f}, {y:.2f}), psi={psi:.2f} rad ({np.degrees(psi):.1f} deg)")
+                
+                # If orientation is zero or very small, make it visible by using a default or skip
+                if np.abs(psi) < 0.01:
+                    print(f"  -> Goal {ii} has near-zero orientation, still drawing arrow")
+                
+                # Arrow pointing from center in direction of psi
+                arrow_start_x = x - (arrow_length * 0.3) * np.cos(psi)
+                arrow_start_y = y - (arrow_length * 0.3) * np.sin(psi)
+                dx = arrow_length * np.cos(psi)
+                dy = arrow_length * np.sin(psi)
+                
+                # Create arrow with different color for goals (darker/black)
+                arrow = FancyArrow(
+                    arrow_start_x, arrow_start_y, dx, dy,
+                    width=r * 0.4,
+                    head_width=r * 1.2,
+                    head_length=r * 0.8,
+                    fc='#000000',  # Black arrow for goal
+                    ec='white',    # White edge for contrast
+                    linewidth=1.5,
+                    zorder=9,
+                    length_includes_head=True
+                )
+                ax.add_patch(arrow)
+                goal_orientation_arrows.append(arrow)
+        
+        print(f"Created {len(orientation_arrows)} agent arrows and {len(goal_orientation_arrows)} goal arrows, show_orientation={show_orientation}")
     else:
         plot_r = ax.transData.transform([r, 0])[0] - ax.transData.transform([0, 0])[0]
         agent_col = ax.scatter(n_pos[:, 0], n_pos[:, 1], n_pos[:, 2],
-                               s=plot_r, c=n_color, zorder=5)  # todo: the size of the agent might not be correct
+                               s=plot_r, c=n_color, zorder=5)
+        orientation_arrows = []  # 3D orientation not implemented yet
 
     # plot edges
     all_pos = graph0.states[:n_agent * 2 + n_hits, :dim]
@@ -338,7 +416,7 @@ def render_video(
 
     # init function for animation
     def init_fn() -> list[plt.Artist]:
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
+        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text, *orientation_arrows, *goal_orientation_arrows]
 
     # update function for animation
     def update(kk: int) -> list[plt.Artist]:
@@ -349,6 +427,75 @@ def render_video(
         if dim == 2:
             for ii in range(n_agent):
                 agent_circs[ii].set_center(tuple(n_pos_t[ii]))
+            
+            # Update orientation arrows
+            if show_orientation and graph.states.shape[1] >= 3:
+                # Update agent arrows
+                for ii in range(n_agent):
+                    x, y = n_pos_t[ii, 0], n_pos_t[ii, 1]
+                    psi = graph.states[ii, 2]
+                    
+                    # Arrow pointing from center in direction of psi
+                    arrow_start_x = x - (arrow_length * 0.3) * np.cos(psi)
+                    arrow_start_y = y - (arrow_length * 0.3) * np.sin(psi)
+                    dx = arrow_length * np.cos(psi)
+                    dy = arrow_length * np.sin(psi)
+                    
+                    # Remove old arrow
+                    if ii < len(orientation_arrows):
+                        orientation_arrows[ii].remove()
+                    
+                    # Create new arrow
+                    arrow = FancyArrow(
+                        arrow_start_x, arrow_start_y, dx, dy,
+                        width=r * 0.4,
+                        head_width=r * 1.2,
+                        head_length=r * 0.8,
+                        fc=arrow_color,
+                        ec='black',
+                        linewidth=1.0,
+                        zorder=9,
+                        length_includes_head=True
+                    )
+                    ax.add_patch(arrow)
+                    if ii < len(orientation_arrows):
+                        orientation_arrows[ii] = arrow
+                    else:
+                        orientation_arrows.append(arrow)
+                
+                # Update goal arrows
+                for ii in range(n_agent):
+                    goal_idx = n_agent + ii
+                    x, y = n_pos_t[goal_idx, 0], n_pos_t[goal_idx, 1]
+                    psi = graph.states[goal_idx, 2]
+                    
+                    # Arrow pointing from center in direction of psi
+                    arrow_start_x = x - (arrow_length * 0.3) * np.cos(psi)
+                    arrow_start_y = y - (arrow_length * 0.3) * np.sin(psi)
+                    dx = arrow_length * np.cos(psi)
+                    dy = arrow_length * np.sin(psi)
+                    
+                    # Remove old arrow
+                    if ii < len(goal_orientation_arrows):
+                        goal_orientation_arrows[ii].remove()
+                    
+                    # Create new arrow
+                    arrow = FancyArrow(
+                        arrow_start_x, arrow_start_y, dx, dy,
+                        width=r * 0.4,
+                        head_width=r * 1.2,
+                        head_length=r * 0.8,
+                        fc='#000000',  # Black arrow for goal
+                        ec='white',    # White edge for contrast
+                        linewidth=1.0,
+                        zorder=9,
+                        length_includes_head=True
+                    )
+                    ax.add_patch(arrow)
+                    if ii < len(goal_orientation_arrows):
+                        goal_orientation_arrows[ii] = arrow
+                    else:
+                        goal_orientation_arrows.append(arrow)
         else:
             agent_col.set_offsets(n_pos_t[:n_agent * 2, :2])
             agent_col.set_3d_properties(n_pos_t[:n_agent * 2, 2], zdir='z')
@@ -403,7 +550,7 @@ def render_video(
 
         kk_text.set_text("kk={:04}".format(kk))
 
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
+        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text, *orientation_arrows, *goal_orientation_arrows]
 
     fps = 30.0
     spf = 1 / fps

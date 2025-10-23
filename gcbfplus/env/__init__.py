@@ -5,6 +5,7 @@ from .single_integrator import SingleIntegrator
 from .double_integrator import DoubleIntegrator
 from .linear_drone import LinearDrone
 from .dubins_car import DubinsCar
+from .quadruped import Quadruped
 from .crazyflie import CrazyFlie
 
 
@@ -14,6 +15,7 @@ ENV = {
     'LinearDrone': LinearDrone,
     'DubinsCar': DubinsCar,
     'CrazyFlie': CrazyFlie,
+    'Quadruped': Quadruped,
 }
 
 
