@@ -253,16 +253,11 @@ def render_video(
         orientation_arrows = []
         goal_orientation_arrows = []
         if show_orientation and graph0.states.shape[1] >= 3:
-            print(f"State shape: {graph0.states.shape}")
-            print(f"First few agent states: {graph0.states[:n_agent, :]}")
-            print(f"First few goal states: {graph0.states[n_agent:n_agent*2, :]}")
             
             # Agent orientation arrows
             for ii in range(n_agent):
                 x, y = n_pos[ii, 0], n_pos[ii, 1]
                 psi = graph0.states[ii, 2]  # Get orientation
-                
-                print(f"Agent {ii}: pos=({x:.2f}, {y:.2f}), psi={psi:.2f} rad ({np.degrees(psi):.1f} deg)")
                 
                 # Arrow pointing from center in direction of psi
                 arrow_start_x = x - (arrow_length * 0.3) * np.cos(psi)
@@ -291,12 +286,6 @@ def render_video(
                 x, y = n_pos[goal_idx, 0], n_pos[goal_idx, 1]
                 psi = graph0.states[goal_idx, 2]  # Get goal orientation
                 
-                print(f"Goal {ii}: pos=({x:.2f}, {y:.2f}), psi={psi:.2f} rad ({np.degrees(psi):.1f} deg)")
-                
-                # If orientation is zero or very small, make it visible by using a default or skip
-                if np.abs(psi) < 0.01:
-                    print(f"  -> Goal {ii} has near-zero orientation, still drawing arrow")
-                
                 # Arrow pointing from center in direction of psi
                 arrow_start_x = x - (arrow_length * 0.3) * np.cos(psi)
                 arrow_start_y = y - (arrow_length * 0.3) * np.sin(psi)
@@ -318,7 +307,6 @@ def render_video(
                 ax.add_patch(arrow)
                 goal_orientation_arrows.append(arrow)
         
-        print(f"Created {len(orientation_arrows)} agent arrows and {len(goal_orientation_arrows)} goal arrows, show_orientation={show_orientation}")
     else:
         plot_r = ax.transData.transform([r, 0])[0] - ax.transData.transform([0, 0])[0]
         agent_col = ax.scatter(n_pos[:, 0], n_pos[:, 1], n_pos[:, 2],

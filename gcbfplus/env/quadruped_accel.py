@@ -14,7 +14,7 @@ from ..utils.utils import merge01, jax_vmap
 from .plot import render_video
 from .utils import get_node_goal_rng, inside_obstacles, get_lidar
 
-class Quadruped(MultiAgentEnv):
+class QuadrupedAccel(MultiAgentEnv):
     
     AGENT = 0
     GOAL = 1
@@ -37,6 +37,7 @@ class Quadruped(MultiAgentEnv):
         "n_rays": 32,
         "obs_len_range": [1.0/48.0, 4.0/48.0],
         "n_obs": 1,
+        "time_horizon": 10
     }
 
     def __init__(
@@ -48,13 +49,13 @@ class Quadruped(MultiAgentEnv):
             dt: float=0.03,
             params: dict=None
     ):
-        super(Quadruped, self).__init__(num_agents, area_size, max_step, max_travel, dt, params)
+        super(QuadrupedAccel, self).__init__(num_agents, area_size, max_step, max_travel, dt, params)
 
         self.create_obstacles = jax_vmap(Rectangle.create)
 
     @property
     def state_dim(self) -> int:
-        return 3 # x, y, yaw
+        return 5 # x, y, yaw, vx, vy
     
     @property
     def node_dim(self) -> int:
@@ -66,7 +67,7 @@ class Quadruped(MultiAgentEnv):
     
     @property
     def action_dim(self) -> int:
-        return 3 # vx, vy, yawrate
+        return 3 # ax, ax, yawrate
     
     def reset(self, key: Array) -> GraphsTuple:
         self._t = 0
@@ -100,9 +101,11 @@ class Quadruped(MultiAgentEnv):
         goal_yaw_key, key = jr.split(key, 2)
         goal_orientations = jr.uniform(goal_yaw_key, (self.num_agents, 1), minval=-jnp.pi, maxval=jnp.pi)
 
-        states = jnp.concatenate([states_pos, agent_orientations], axis=1)
-        goals = jnp.concatenate([goals_pos, goal_orientations], axis=1)
+        agent_v_x = jnp.zeros((self.num_agents, 1))
+        agent_v_y = jnp.zeros((self.num_agents, 1))
 
+        states = jnp.concatenate([states_pos, agent_orientations, agent_v_x, agent_v_y], axis=1)
+        goals = jnp.concatenate([goals_pos, goal_orientations, agent_v_x, agent_v_y], axis=1)
         env_states = self.EnvState(states, goals, obstacles)
 
         return self.get_graph(env_states)
@@ -111,22 +114,31 @@ class Quadruped(MultiAgentEnv):
         assert action.shape == (self.num_agents, self.action_dim)
         assert agent_states.shape == (self.num_agents, self.state_dim)
 
+
         # Scale normalized actions to actual physical ranges
         lower, upper = jnp.array([-2.0 / 48.0, -1.5 / 48.0, -2.0]), jnp.array([3.0 / 48.0, 1.5 / 48.0, 2.0])
         scaled_action = 0.5 * ((action + 1.0) * (upper - lower)) + lower
 
         # Unpack
-        vx = scaled_action[:, 0]
-        vy = scaled_action[:, 1]
+        ax = scaled_action[:, 0]
+        ay = scaled_action[:, 1]
         yaw_rate = scaled_action[:, 2]
+        vx = agent_states[:, 3]
+        vy = agent_states[:, 4]
         yaw = agent_states[:, 2]
 
         # Compute global velocity derivatives
         x_dot = vx * jnp.cos(yaw) - vy * jnp.sin(yaw)
         y_dot = vx * jnp.sin(yaw) + vy * jnp.cos(yaw)
+
+        x_dot_dot = ax
+        y_dot_dot = ay
+        
         yaw_dot = yaw_rate
 
-        return jnp.stack([x_dot, y_dot, yaw_dot], axis=1)
+
+
+        return jnp.stack([x_dot, y_dot, yaw_dot, x_dot_dot, y_dot_dot], axis=1)
     
     def agent_step_euler(self, agent_states: AgentState, action: Action) -> AgentState:
         assert action.shape == (self.num_agents, self.action_dim)
@@ -144,6 +156,7 @@ class Quadruped(MultiAgentEnv):
             self, graph: EnvGraphsTuple, action: Action, get_eval_info: bool = False
     ) -> Tuple[EnvGraphsTuple, Reward, Cost, Done, Info]:
         self._t += 1
+
         
         # Calculate next graph
         agent_states = graph.type_states(type_idx=0, n_type=self.num_agents)
@@ -158,6 +171,7 @@ class Quadruped(MultiAgentEnv):
 
         next_agent_states = self.agent_step_euler(agent_states, action)
 
+
         # Episode ends when reaching max episode steps
         done = jnp.array(False)
 
@@ -166,6 +180,7 @@ class Quadruped(MultiAgentEnv):
         reward -= (jnp.linalg.norm(action - self.u_ref(graph), axis=-1) ** 2).mean()
 
         cost = self.get_cost(graph)
+
 
         assert reward.shape == tuple()
         assert cost.shape == tuple()
@@ -232,6 +247,7 @@ class Quadruped(MultiAgentEnv):
 
     def edge_blocks(self, state: EnvState, lidar_data: Pos2d) -> list[EdgeBlock]:
         # Total number of lidar hits
+
         n_hits = self._params["n_rays"] * self.num_agents
 
         # agent - agent connection
@@ -275,21 +291,22 @@ class Quadruped(MultiAgentEnv):
     def control_affine_dyn(self, state: State) -> [Array, Array]:
         assert state.ndim == 2
 
+        vx = state[:, 3]
+        vy = state[:, 4]
         yaw = state[:, 2]
+
 
         # f is 0, no drift
         f = jnp.zeros_like(state)
+        f = f.at[:, 0].set(vx * jnp.cos(yaw) - vy * jnp.sin(yaw))
+        f = f.at[:, 1].set(vx * jnp.sin(yaw) + vy * jnp.cos(yaw))
 
         # define g
         g = jnp.zeros((state.shape[0], self.state_dim, self.action_dim))
 
         # dx
-        g = g.at[:, 0, 0].set(jnp.cos(yaw))
-        g = g.at[:, 0, 1].set(-jnp.sin(yaw))
-
-        # dy
-        g = g.at[:, 1, 0].set(jnp.sin(yaw))
-        g = g.at[:, 1, 1].set(jnp.cos(yaw))
+        g = g.at[:, 3, 0].set(1.0)
+        g = g.at[:, 4, 1].set(1.0)
 
         # dyaw
         g = g.at[:, 2, 2].set(1.0)
@@ -323,8 +340,8 @@ class Quadruped(MultiAgentEnv):
 
         # node type
         node_type = jnp.zeros(n_nodes, dtype=jnp.int32)
-        node_type = node_type.at[self.num_agents: self.num_agents * 2].set(Quadruped.GOAL)
-        node_type = node_type.at[-n_hits:].set(Quadruped.OBS)
+        node_type = node_type.at[self.num_agents: self.num_agents * 2].set(QuadrupedAccel.GOAL)
+        node_type = node_type.at[-n_hits:].set(QuadrupedAccel.OBS)
 
         # edge blocks
         get_lidar_vmap = jax_vmap(
@@ -338,9 +355,9 @@ class Quadruped(MultiAgentEnv):
 
         lidar_data = merge01(get_lidar_vmap(state.agent[:, :2]))  # Lidar only uses x, y
         # Pad lidar data with zeros for orientation to match state dimension
-        lidar_data_padded = jnp.concatenate([lidar_data, jnp.zeros((lidar_data.shape[0], 1))], axis=1)
+        lidar_data_padded = jnp.concatenate([lidar_data, jnp.zeros((lidar_data.shape[0], 1)), jnp.zeros((lidar_data.shape[0], 1)), jnp.zeros((lidar_data.shape[0], 1))], axis=1)
         edge_blocks = self.edge_blocks(state, lidar_data)
-
+        
         # create graph
         return GetGraph(
             nodes=node_feats,
@@ -351,8 +368,8 @@ class Quadruped(MultiAgentEnv):
         ).to_padded()
     
     def state_lim(self, state: Optional[State] = None) -> Tuple[State, State]:
-        lower_lim = jnp.array([-jnp.inf, -jnp.inf, -jnp.pi])
-        upper_lim = jnp.array([jnp.inf, jnp.inf, jnp.pi])
+        lower_lim = jnp.array([-jnp.inf, -jnp.inf, -jnp.pi, -jnp.inf, -jnp.inf])
+        upper_lim = jnp.array([jnp.inf, jnp.inf, jnp.pi, jnp.inf, jnp.inf])
         return lower_lim, upper_lim
     
     def action_lim(self) -> Tuple[Action, Action]:
@@ -361,47 +378,71 @@ class Quadruped(MultiAgentEnv):
         return lower_lim, upper_lim
     
     def u_ref(self, graph: GraphsTuple) -> Action:
-        agent = graph.type_states(type_idx=0, n_type=self.num_agents)
-        goal = graph.type_states(type_idx=1, n_type=self.num_agents)
-        
+        agent = graph.type_states(type_idx=0, n_type=self.num_agents) # num_agents, state_dim
+        goal = graph.type_states(type_idx=1, n_type=self.num_agents) # num_agents, state_dim
+
+        vx = agent[:, 3] # num_agents
+        vy = agent[:, 4] # num_agents
+        yaw = agent[:, 2] #num_agents
+
+        u_ref = jnp.zeros((self.num_agents, self.action_dim, self.PARAMS["time_horizon"])) # num_agents, action_dim, time_horizon
+
         # Position error in global frame
-        pos_error = goal[:, :2] - agent[:, :2]
-        
-        # Clip error to avoid too large references (similar to original)
-        error_norm = jnp.linalg.norm(pos_error, axis=-1, keepdims=True)
-        error_max = self._params["comm_radius"]
-        error_clipped = jnp.clip(pos_error, -error_max, error_max)
-        
-        # Compute desired velocity in global frame
-        vel_global = error_clipped
-        
-        # Transform to body frame
-        psi = agent[:, 2]
-        cos_psi = jnp.cos(psi)
-        sin_psi = jnp.sin(psi)
-        
-        vx_desired = vel_global[:, 0] * cos_psi + vel_global[:, 1] * sin_psi
-        vy_desired = -vel_global[:, 0] * sin_psi + vel_global[:, 1] * cos_psi
-        
-        # Orientation control: align with movement direction or goal orientation
-        # If moving, align with velocity direction; otherwise align with goal
-        vel_mag = jnp.sqrt(vel_global[:, 0]**2 + vel_global[:, 1]**2 + 1e-6)
-        desired_heading = jnp.arctan2(vel_global[:, 1], vel_global[:, 0])
-        
-        # Use goal orientation when close to goal, movement direction otherwise
-        weight = jnp.clip(vel_mag / (self._params["car_radius"] * 4), 0.0, 1.0)
-        target_psi = weight * desired_heading + (1 - weight) * goal[:, 2]
-        
-        psi_error = target_psi - agent[:, 2]
-        psi_error = jnp.arctan2(jnp.sin(psi_error), jnp.cos(psi_error))
-        psi_dot_desired = psi_error * 2.0
-        
-        action = jnp.stack([vx_desired, vy_desired, psi_dot_desired], axis=1)
+        state_error = jnp.zeros((self.num_agents, self.state_dim, self.PARAMS["time_horizon"])) # num_agents, state_dim, time_horizon
+        state_error = state_error.at[:, :, 0].set(agent - goal)
 
-        # Scale down to [-1, 1]
+        Q = jnp.expand_dims(jnp.diag(jnp.array([1, 1, 1, 0, 0])), 0).repeat(self.num_agents, axis=0) # num_agents, state_dim, state_dim
+        R = jnp.expand_dims(jnp.diag(jnp.array([1, 1, 1])), 0).repeat(self.num_agents, axis=0) # num_agents, action_dim, action_dim
+
+        V = 0.5 * jnp.transpose(jnp.expand_dims(state_error[:, :, -1], -1), (0, 2, 1)) @ Q @ jnp.expand_dims(state_error[:, :, -1], -1) # num_agents
+
+        Vx = Q @ jnp.expand_dims(state_error[:, :, -1], -1) # num_agents, state_dim, 1
+
+        Vxx = Q # num_agents, state_dim, state_dim
+
+        for k in range(self.PARAMS["time_horizon"] - 1, 0, -1):
+
+            lx = Q @ jnp.expand_dims(state_error[:, :, k], -1) # num_agents, state_dim, 1
+            lu = R @ jnp.expand_dims(u_ref[:, :, k], -1) # num_agents, action_dim
+            lxx = Q # num_agents, state_dim, state_dim
+            luu = R # num_agents, action_dim, action_dim
+            lxu = jnp.zeros((self.num_agents, self.state_dim, self.action_dim)) # num_agents, state_dim, action_dim
+
+            fx = jnp.zeros((self.num_agents, self.state_dim, self.state_dim)) # num_agents, state_dim, state_dim
+            fx = fx.at[:, 0, 2].set(-vx * jnp.sin(yaw) - vy * jnp.cos(yaw))
+            fx = fx.at[:, 0, 3].set(jnp.cos(yaw))
+            fx = fx.at[:, 0, 4].set(-jnp.sin(yaw))
+
+            fx = fx.at[:, 1, 2].set(vx * jnp.cos(yaw) - vy * jnp.sin(yaw))
+            fx = fx.at[:, 1, 3].set(jnp.sin(yaw))
+            fx = fx.at[:, 1, 4].set(jnp.cos(yaw))
+
+            fu = jnp.zeros((self.num_agents, self.state_dim, self.action_dim)) # num_agents, state_dim, action_dim
+            fu = fu.at[:, 2, 2].set(1)
+            fu = fu.at[:, 3, 0].set(1)
+            fu = fu.at[:, 4, 1].set(1)
+
+            Qx = lx + jnp.transpose(fx, (0, 2, 1)) @ Vx # num_agents, state_dim, 1
+            Qu = lu + jnp.transpose(fu, (0, 2, 1)) @ Vx # num_agents, action_dim, 1
+            Qxx = lxx + jnp.transpose(fx, (0, 2, 1)) @ Vxx @ fx # num_agents, state_dim, state_dim
+            Quu = luu + jnp.transpose(fu, (0, 2, 1)) @ Vxx @ fu # num_agents, action_dim, action_dim
+            Qxu = lxu + jnp.transpose(fx, (0, 2, 1)) @ Vxx @ fu # num_agents, state_dim, action_dim
+
+            Vnext = -0.5 * jnp.transpose(Qu, (0, 2, 1)) @ jnp.linalg.inv(Quu) @ Qu # num_agents
+            Vxnext = Qx - Qxu @ jnp.linalg.inv(Quu) @ Qu # num_agents, state_dim
+            Vxxnext = Qxx - Qxu @ jnp.linalg.inv(Quu) @ jnp.transpose(Qxu, (0, 2, 1)) #num_agents, state_dim, state_dim
+
+            feedforward_gain = -jnp.linalg.inv(Quu) @ Qu # num_agents, action_dim
+            feedback_gain = -jnp.linalg.inv(Quu) @ jnp.transpose(Qxu, (0, 2, 1)) # num_agents, action_dim, state_dim
+
+            V = Vnext 
+            Vx = Vxnext
+            Vxx = Vxxnext
+
+            u_ref = u_ref.at[:, :, k - 1].set(jnp.squeeze(feedforward_gain + feedback_gain @ jnp.expand_dims(state_error[:, :, k], -1), -1)) # num_agents, action_dim
+
         lower, upper = jnp.array([-2.0 / 48.0, -1.5 / 48.0, -2.0]), jnp.array([3.0 / 48.0, 1.5 / 48.0, 2.0])
-        u_norm = 2.0 * (action  - lower) / (upper - lower) - 1.0
-
+        u_norm = 2.0 * (u_ref[:, :, -1]  - lower) / (upper - lower) - 1.0
         return self.clip_action(u_norm)
     
     def forward_graph(self, graph: GraphsTuple, action: Action) -> GraphsTuple:

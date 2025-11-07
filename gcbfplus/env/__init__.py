@@ -6,6 +6,7 @@ from .double_integrator import DoubleIntegrator
 from .linear_drone import LinearDrone
 from .dubins_car import DubinsCar
 from .quadruped import Quadruped
+from .quadruped_accel import QuadrupedAccel
 from .crazyflie import CrazyFlie
 
 
@@ -16,10 +17,11 @@ ENV = {
     'DubinsCar': DubinsCar,
     'CrazyFlie': CrazyFlie,
     'Quadruped': Quadruped,
+    'QuadrupedAccel': QuadrupedAccel
 }
 
 
-DEFAULT_MAX_STEP = 256
+DEFAULT_MAX_STEP = 512
 
 
 def make_env(
