@@ -4,6 +4,9 @@ import jax.random as jr
 import numpy as np
 import pathlib
 import functools as ft
+import matplotlib.pyplot as plt
+from jax import lax
+from jax.scipy.linalg import cho_factor, cho_solve
 
 from .base import MultiAgentEnv, RolloutResult
 from ..utils.typing import State, Array, AgentState, Action, Reward, Cost, Done, Info, Pos2d
@@ -19,6 +22,7 @@ class QuadrupedAccel(MultiAgentEnv):
     AGENT = 0
     GOAL = 1
     OBS = 2
+    ENV_SIZE = 48.0
 
     class EnvState(NamedTuple):
         agent: State
@@ -32,12 +36,15 @@ class QuadrupedAccel(MultiAgentEnv):
     EnvGraphsTuple = GraphsTuple[State, EnvState]
 
     PARAMS = {
-        "car_radius": 0.55/48.0,
-        "comm_radius": 5.5/48.0,
+        "car_radius": 0.55/ENV_SIZE,
+        "comm_radius": 5.5/ENV_SIZE,
         "n_rays": 32,
-        "obs_len_range": [1.0/48.0, 4.0/48.0],
+        "obs_len_range": [1.0/ENV_SIZE, 4.0/ENV_SIZE],
         "n_obs": 1,
-        "time_horizon": 10
+        "time_horizon": 10,
+        "ilqr_iterations": 20,
+        "action_lower": np.array([-0.75/ENV_SIZE, -0.75/ENV_SIZE, -1.0]),
+        "action_upper": np.array([0.75/ENV_SIZE, 0.75/ENV_SIZE, 1.0])
     }
 
     def __init__(
@@ -50,7 +57,7 @@ class QuadrupedAccel(MultiAgentEnv):
             params: dict=None
     ):
         super(QuadrupedAccel, self).__init__(num_agents, area_size, max_step, max_travel, dt, params)
-
+        self.trajs = []
         self.create_obstacles = jax_vmap(Rectangle.create)
 
     @property
@@ -114,10 +121,8 @@ class QuadrupedAccel(MultiAgentEnv):
         assert action.shape == (self.num_agents, self.action_dim)
         assert agent_states.shape == (self.num_agents, self.state_dim)
 
-
         # Scale normalized actions to actual physical ranges
-        lower, upper = jnp.array([-2.0 / 48.0, -1.5 / 48.0, -2.0]), jnp.array([3.0 / 48.0, 1.5 / 48.0, 2.0])
-        scaled_action = 0.5 * ((action + 1.0) * (upper - lower)) + lower
+        scaled_action = 0.5 * ((action + 1.0) * (self.PARAMS["action_upper"] - self.PARAMS["action_lower"])) + self.PARAMS["action_lower"]
 
         # Unpack
         ax = scaled_action[:, 0]
@@ -135,8 +140,6 @@ class QuadrupedAccel(MultiAgentEnv):
         y_dot_dot = ay
         
         yaw_dot = yaw_rate
-
-
 
         return jnp.stack([x_dot, y_dot, yaw_dot, x_dot_dot, y_dot_dot], axis=1)
     
@@ -231,6 +234,9 @@ class QuadrupedAccel(MultiAgentEnv):
         viz_opts['show_orientation'] = True
         viz_opts['arrow_length'] = self.params["car_radius"] * 2.0
 
+        new_trajs = np.array(self.trajs)
+        new_trajs = new_trajs[::2]
+
         render_video(
             rollout=rollout,
             video_path=video_path,
@@ -242,6 +248,7 @@ class QuadrupedAccel(MultiAgentEnv):
             Ta_is_unsafe=Ta_is_unsafe,
             viz_opts=viz_opts,
             dpi=dpi,
+            trajs=new_trajs,
             **kwargs
         )
 
@@ -376,74 +383,274 @@ class QuadrupedAccel(MultiAgentEnv):
         lower_lim = jnp.ones(3) * -1.0
         upper_lim = jnp.ones(3)
         return lower_lim, upper_lim
-    
+
+    @ft.partial(jax.jit, static_argnums=(0,))
     def u_ref(self, graph: GraphsTuple) -> Action:
-        agent = graph.type_states(type_idx=0, n_type=self.num_agents) # num_agents, state_dim
-        goal = graph.type_states(type_idx=1, n_type=self.num_agents) # num_agents, state_dim
+        agent = graph.type_states(type_idx=0, n_type=self.num_agents)
+        goal  = graph.type_states(type_idx=1, n_type=self.num_agents)
 
-        vx = agent[:, 3] # num_agents
-        vy = agent[:, 4] # num_agents
-        yaw = agent[:, 2] #num_agents
+        Q = jnp.expand_dims(jnp.diag(jnp.array([1,1,0.1,1,1])), 0).repeat(self.num_agents, 0)
+        Qf = jnp.expand_dims(jnp.diag(jnp.array([10,10,1,10,10])), 0).repeat(self.num_agents, 0)
+        R = jnp.expand_dims(jnp.diag(jnp.array([30,30,100])), 0).repeat(self.num_agents, 0)
 
-        u_ref = jnp.zeros((self.num_agents, self.action_dim, self.PARAMS["time_horizon"])) # num_agents, action_dim, time_horizon
+        def forward_roll(x, u):
+            # JIT these helpers too
+            return self.agent_step_euler(x, u)
 
-        # Position error in global frame
-        state_error = jnp.zeros((self.num_agents, self.state_dim, self.PARAMS["time_horizon"])) # num_agents, state_dim, time_horizon
-        state_error = state_error.at[:, :, 0].set(agent - goal)
+        def ilqr_iter(carry, _):
+            x_ref, u_ref = carry
 
-        Q = jnp.expand_dims(jnp.diag(jnp.array([1, 1, 1, 0, 0])), 0).repeat(self.num_agents, axis=0) # num_agents, state_dim, state_dim
-        R = jnp.expand_dims(jnp.diag(jnp.array([1, 1, 1])), 0).repeat(self.num_agents, axis=0) # num_agents, action_dim, action_dim
+            # ----- backward pass over time with lax.scan -----
+            def bwd_step(carry_b, k):
+                Vx, Vxx = carry_b
+                vx = x_ref[:, 3, k]; vy = x_ref[:, 4, k]; yaw = x_ref[:, 2, k]
 
-        V = 0.5 * jnp.transpose(jnp.expand_dims(state_error[:, :, -1], -1), (0, 2, 1)) @ Q @ jnp.expand_dims(state_error[:, :, -1], -1) # num_agents
+                lx  = Q @ (x_ref[:, :, k] - goal)[..., None]
+                lu  = R @ u_ref[:, :, k][..., None]
+                lxx = Q
+                luu = R
+                lxu = jnp.zeros((self.num_agents, self.state_dim, self.action_dim))
 
-        Vx = Q @ jnp.expand_dims(state_error[:, :, -1], -1) # num_agents, state_dim, 1
+                fx = jnp.zeros((self.num_agents, self.state_dim, self.state_dim))
+                fx = fx.at[:, 0, 2].set(-vx * jnp.sin(yaw) - vy * jnp.cos(yaw))
+                fx = fx.at[:, 0, 3].set(jnp.cos(yaw))
+                fx = fx.at[:, 0, 4].set(-jnp.sin(yaw))
+                fx = fx.at[:, 1, 2].set(vx * jnp.cos(yaw) - vy * jnp.sin(yaw))
+                fx = fx.at[:, 1, 3].set(jnp.sin(yaw))
+                fx = fx.at[:, 1, 4].set(jnp.cos(yaw))
+                fx = jnp.eye(self.state_dim).reshape((1, self.state_dim, self.state_dim)).repeat(self.num_agents, axis=0) + (fx * self.dt)
 
-        Vxx = Q # num_agents, state_dim, state_dim
+                fu = jnp.zeros((self.num_agents, self.state_dim, self.action_dim))
+                fu = fu.at[:, 2, 2].set(1.0)
+                fu = fu.at[:, 3, 0].set(1.0)
+                fu = fu.at[:, 4, 1].set(1.0)
+                fu = fu * self.dt
 
-        for k in range(self.PARAMS["time_horizon"] - 1, 0, -1):
+                Qx  = lx + jnp.transpose(fx, (0,2,1)) @ Vx
+                Qu  = lu + jnp.transpose(fu, (0,2,1)) @ Vx
+                Qxx = lxx + jnp.transpose(fx, (0,2,1)) @ Vxx @ fx
+                Quu = luu + jnp.transpose(fu, (0,2,1)) @ Vxx @ fu + (jnp.eye(self.action_dim).reshape(1, self.action_dim, self.action_dim).repeat(self.num_agents, axis=0) * 0.01)
+                # jax.debug.print("{x}", x=Quu)
+                Qxu = lxu + jnp.transpose(fx, (0,2,1)) @ Vxx @ fu
 
-            lx = Q @ jnp.expand_dims(state_error[:, :, k], -1) # num_agents, state_dim, 1
-            lu = R @ jnp.expand_dims(u_ref[:, :, k], -1) # num_agents, action_dim
-            lxx = Q # num_agents, state_dim, state_dim
-            luu = R # num_agents, action_dim, action_dim
-            lxu = jnp.zeros((self.num_agents, self.state_dim, self.action_dim)) # num_agents, state_dim, action_dim
+                # batch Cholesky solve for stability
+                def solve_batch(Quu_i, b_i):
+                    L, lower = cho_factor(Quu_i)
+                    return cho_solve((L, lower), b_i)
 
-            fx = jnp.zeros((self.num_agents, self.state_dim, self.state_dim)) # num_agents, state_dim, state_dim
-            fx = fx.at[:, 0, 2].set(-vx * jnp.sin(yaw) - vy * jnp.cos(yaw))
-            fx = fx.at[:, 0, 3].set(jnp.cos(yaw))
-            fx = fx.at[:, 0, 4].set(-jnp.sin(yaw))
+                k_ff = -jax.vmap(solve_batch)(Quu, Qu)
+                k_fb = -jax.vmap(solve_batch)(Quu, jnp.transpose(Qxu, (0,2,1)))
 
-            fx = fx.at[:, 1, 2].set(vx * jnp.cos(yaw) - vy * jnp.sin(yaw))
-            fx = fx.at[:, 1, 3].set(jnp.sin(yaw))
-            fx = fx.at[:, 1, 4].set(jnp.cos(yaw))
+                Vx_next  = Qx + Qxu @ k_ff
+                Vxx_next = Qxx + Qxu @ k_fb
 
-            fu = jnp.zeros((self.num_agents, self.state_dim, self.action_dim)) # num_agents, state_dim, action_dim
-            fu = fu.at[:, 2, 2].set(1)
-            fu = fu.at[:, 3, 0].set(1)
-            fu = fu.at[:, 4, 1].set(1)
+                return (Vx_next, Vxx_next), (k_ff.squeeze(-1), k_fb)  # save gains
 
-            Qx = lx + jnp.transpose(fx, (0, 2, 1)) @ Vx # num_agents, state_dim, 1
-            Qu = lu + jnp.transpose(fu, (0, 2, 1)) @ Vx # num_agents, action_dim, 1
-            Qxx = lxx + jnp.transpose(fx, (0, 2, 1)) @ Vxx @ fx # num_agents, state_dim, state_dim
-            Quu = luu + jnp.transpose(fu, (0, 2, 1)) @ Vxx @ fu # num_agents, action_dim, action_dim
-            Qxu = lxu + jnp.transpose(fx, (0, 2, 1)) @ Vxx @ fu # num_agents, state_dim, action_dim
+            # init at T: Vx=Q(x_T - goal), Vxx=Q
+            Vx_T  = (Qf @ (x_ref[:, :, -1] - goal)[..., None]).astype(jnp.float32)
+            Vxx_T = Qf.astype(jnp.float32)
+            ks, gains = lax.scan(
+                f=bwd_step,
+                init=(Vx_T, Vxx_T),
+                xs=jnp.arange(self.PARAMS["time_horizon"]-1, -1, -1)
+            )
+            ff_gains, fb_gains = gains  # shapes: [T, N, A] and [T, N, A, X]
+            ff_gains = ff_gains[::-1]; fb_gains = fb_gains[::-1]  # reverse
+            # # ----- forward pass with lax.scan -----
+            # def fwd_step(carry_f, k):
+            #     xk = carry_f
+            #     du = 0.1 * ff_gains[k] + (fb_gains[k] @ (xk - x_ref[:, :, k])[..., None]).squeeze(-1)
+            #     uk = u_ref[:, :, k] + du
+            #     xk1 = forward_roll(xk, uk)
+            #     return xk1, (uk, xk1)
+            alphas = jnp.logspace(0, -5, 30)
 
-            Vnext = -0.5 * jnp.transpose(Qu, (0, 2, 1)) @ jnp.linalg.inv(Quu) @ Qu # num_agents
-            Vxnext = Qx - Qxu @ jnp.linalg.inv(Quu) @ Qu # num_agents, state_dim
-            Vxxnext = Qxx - Qxu @ jnp.linalg.inv(Quu) @ jnp.transpose(Qxu, (0, 2, 1)) #num_agents, state_dim, state_dim
+            def rollout_with_alpha(alpha):
+                def fwd_step(xk, k):
+                    du = alpha * ff_gains[k] + (fb_gains[k] @ (xk - x_ref[:, :, k])[..., None]).squeeze(-1)
+                    uk = u_ref[:, :, k] + du
+                    xk1 = forward_roll(xk, uk)
+                    return xk1, (uk, xk1)
 
-            feedforward_gain = -jnp.linalg.inv(Quu) @ Qu # num_agents, action_dim
-            feedback_gain = -jnp.linalg.inv(Quu) @ jnp.transpose(Qxu, (0, 2, 1)) # num_agents, action_dim, state_dim
+                x0 = x_ref[:, :, 0]
+                _, (u_new_seq, x_new_seq) = lax.scan(fwd_step, x0, jnp.arange(self.PARAMS["time_horizon"]))
+                x_ref_new = jnp.concatenate([x0[..., None], jnp.transpose(x_new_seq, (1,2,0))], axis=-1)
+                u_ref_new = jnp.transpose(u_new_seq, (1,2,0))
+                return x_ref_new, u_ref_new
 
-            V = Vnext 
-            Vx = Vxnext
-            Vxx = Vxxnext
 
-            u_ref = u_ref.at[:, :, k - 1].set(jnp.squeeze(feedforward_gain + feedback_gain @ jnp.expand_dims(state_error[:, :, k], -1), -1)) # num_agents, action_dim
+            def compute_cost(xr, ur):
+                # assume single agent for now (index 0)
+                g0 = goal[0]  # shape (state_dim,)
 
-        lower, upper = jnp.array([-2.0 / 48.0, -1.5 / 48.0, -2.0]), jnp.array([3.0 / 48.0, 1.5 / 48.0, 2.0])
-        u_norm = 2.0 * (u_ref[:, :, -1]  - lower) / (upper - lower) - 1.0
-        return self.clip_action(u_norm)
+                def cstep(carry, k):
+                    j = carry
+                    xk = xr[0, :, k] - g0       # distance to goal
+                    uk = ur[0, :, k]
+
+                    # Q, R are (5,5) and (3,3) or use Q[0], R[0] if batched
+                    stage = xk.T @ Q[0] @ xk + uk.T @ R[0] @ uk
+                    stage = jnp.squeeze(stage)
+                    return j + stage, None
+
+                j0 = 0.0
+                T = ur.shape[-1]
+                j, _ = lax.scan(cstep, j0, jnp.arange(T))
+
+                xT = xr[0, :, T-1] - g0
+                terminal = jnp.squeeze(xT.T @ Qf[0] @ xT)
+
+                return j + terminal
+
+
+            def try_alpha(alpha):
+                xr, ur = rollout_with_alpha(alpha)
+                cost = compute_cost(xr, ur)
+                return cost, xr, ur
+
+            costs, xs, us = jax.vmap(try_alpha)(alphas)
+
+            best_idx = jnp.argmin(costs)
+            x_ref_new = xs[best_idx]
+            u_ref_new = us[best_idx]
+            best_alpha = alphas[best_idx]
+            # jax.debug.print("Chosen alpha = {a}", a=best_alpha)
+
+            # x0 = x_ref[:, :, 0]
+            # _, (u_new_seq, x_new_seq) = lax.scan(fwd_step, x0, jnp.arange(self.PARAMS["time_horizon"]))
+            # x_ref_new = jnp.concatenate([x0[..., None], jnp.transpose(x_new_seq, (1,2,0))], axis=-1)
+            # u_ref_new = jnp.transpose(u_new_seq, (1,2,0))
+            
+            j_new = 0.0
+            g0 = goal[0]
+            for k in range(self.PARAMS["time_horizon"]):
+                x_err = x_ref_new[0, :, k] - g0
+                u_k   = u_ref_new[0, :, k]
+                j_new = j_new + x_err.T @ Q[0] @ x_err + u_k.T @ R[0] @ u_k
+
+            x_err_T = x_ref_new[0, :, self.PARAMS["time_horizon"]-1] - g0
+            j_new = j_new + x_err_T.T @ Qf[0] @ x_err_T
+            # jax.debug.print("{x}", x=j_new)
+
+            return (x_ref_new, u_ref_new), None
+
+        # initialize refs (zeros u, start from agent state)
+        u0 = jnp.zeros((self.num_agents, self.action_dim, self.PARAMS["time_horizon"]))
+        x0 = jnp.zeros((self.num_agents, self.state_dim, self.PARAMS["time_horizon"] + 1))
+        x0 = x0.at[:, :, 0].set(agent)
+        (x_ref, u_ref), _ = lax.scan(ilqr_iter, (x0, u0), None, length=self.PARAMS["ilqr_iterations"])
+        jax.debug.print("{a}", a=x_ref[:,:3,:])
+        jax.debug.print("done")
+
+        jax.debug.callback(self.add_traj, x_ref)
+        # scale to normalized action space using solve instead of ad-hoc inv
+        # breakpoint()
+        u_norm0 = 2.0 * (u_ref[:, :, 0] - self.PARAMS["action_lower"]) / (self.PARAMS["action_upper"] - self.PARAMS["action_lower"]) - 1.0
+        return self.clip_action(u_norm0)
+    
+    def add_traj(self, x_ref):
+        x_ref_new = jax.device_get(x_ref)
+        self.trajs.append(x_ref_new)
+        # np.save('trajs.npy', np.array(self.trajs))
+
+    # def u_ref(self, graph: GraphsTuple) -> Action:
+    #     agent = graph.type_states(type_idx=0, n_type=self.num_agents) # num_agents, state_dim
+    #     goal = graph.type_states(type_idx=1, n_type=self.num_agents) # num_agents, state_dim
+
+    #     u_ref = jnp.zeros((self.num_agents, self.action_dim, self.PARAMS["time_horizon"])) # num_agents, action_dim, time_horizon
+    #     x_ref = jnp.zeros((self.num_agents, self.state_dim, self.PARAMS["time_horizon"])) # num_agents, state_dim, time_horizon
+
+    #     x_ref = x_ref.at[:, :, 0].set(agent)
+
+    #     for k in range(self.PARAMS["time_horizon"]):
+    #         x_ref = x_ref.at[:, :, k+1].set(self.agent_step_euler(x_ref[:, :, k], u_ref[:, :, k]))
+
+    #     # Position error in global frame
+    #     # state_error = jnp.zeros((self.num_agents, self.state_dim, self.PARAMS["time_horizon"])) # num_agents, state_dim, time_horizon
+    #     # state_error = state_error.at[:, :, 0].set(agent - goal)
+
+    #     Q = jnp.expand_dims(jnp.diag(jnp.array([100, 100, 1, 10, 10])), 0).repeat(self.num_agents, axis=0) # num_agents, state_dim, state_dim
+    #     R = jnp.expand_dims(jnp.diag(jnp.array([100, 100, 100])), 0).repeat(self.num_agents, axis=0) # num_agents, action_dim, action_dim
+        
+    #     for i in range(self.PARAMS["ilqr_iterations"]):
+
+    #         # V = 0.5 * jnp.transpose(jnp.expand_dims(x_ref[:, :, -1], -1), (0, 2, 1)) @ Q @ jnp.expand_dims(x_ref[:, :, -1], -1) # num_agents
+
+    #         Vx = Q @ jnp.expand_dims(x_ref[:, :, -1] - goal, -1) # num_agents, state_dim, 1
+
+    #         Vxx = Q # num_agents, state_dim, state_dim
+
+    #         feedforward_gain = jnp.zeros((self.num_agents, self.action_dim, self.PARAMS["time_horizon"]))
+    #         feedback_gain = jnp.zeros((self.num_agents, self.action_dim, self.state_dim, self.PARAMS["time_horizon"]))
+
+    #         for k in range(self.PARAMS["time_horizon"] - 1, -1, -1):
+
+    #             vx = x_ref[:, 3, k] # num_agents
+    #             vy = x_ref[:, 4, k] # num_agents
+    #             yaw = x_ref[:, 2, k] #num_agents
+
+    #             lx = Q @ jnp.expand_dims(x_ref[:, :, k] - goal, -1) # num_agents, state_dim, 1
+    #             lu = R @ jnp.expand_dims(u_ref[:, :, k], -1) # num_agents, action_dim
+    #             lxx = Q # num_agents, state_dim, state_dim
+    #             luu = R # num_agents, action_dim, action_dim
+    #             lxu = jnp.zeros((self.num_agents, self.state_dim, self.action_dim)) # num_agents, state_dim, action_dim
+
+    #             fx = jnp.zeros((self.num_agents, self.state_dim, self.state_dim)) # num_agents, state_dim, state_dim
+    #             fx = fx.at[:, 0, 2].set(-vx * jnp.sin(yaw) - vy * jnp.cos(yaw))
+    #             fx = fx.at[:, 0, 3].set(jnp.cos(yaw))
+    #             fx = fx.at[:, 0, 4].set(-jnp.sin(yaw))
+
+    #             fx = fx.at[:, 1, 2].set(vx * jnp.cos(yaw) - vy * jnp.sin(yaw))
+    #             fx = fx.at[:, 1, 3].set(jnp.sin(yaw))
+    #             fx = fx.at[:, 1, 4].set(jnp.cos(yaw))
+
+    #             fu = jnp.zeros((self.num_agents, self.state_dim, self.action_dim)) # num_agents, state_dim, action_dim
+    #             fu = fu.at[:, 2, 2].set(1)
+    #             fu = fu.at[:, 3, 0].set(1)
+    #             fu = fu.at[:, 4, 1].set(1)
+
+    #             Qx = lx + jnp.transpose(fx, (0, 2, 1)) @ Vx # num_agents, state_dim, 1
+    #             Qu = lu + jnp.transpose(fu, (0, 2, 1)) @ Vx # num_agents, action_dim, 1
+    #             Qxx = lxx + jnp.transpose(fx, (0, 2, 1)) @ Vxx @ fx # num_agents, state_dim, state_dim
+    #             Quu = luu + jnp.transpose(fu, (0, 2, 1)) @ Vxx @ fu # num_agents, action_dim, action_dim
+    #             Qxu = lxu + jnp.transpose(fx, (0, 2, 1)) @ Vxx @ fu # num_agents, state_dim, action_dim
+
+    #             # Vnext = -0.5 * jnp.transpose(Qu, (0, 2, 1)) @ jnp.linalg.inv(Quu) @ Qu # num_agents
+    #             Vxnext = Qx - Qxu @ jnp.linalg.inv(Quu) @ Qu # num_agents, state_dim
+    #             Vxxnext = Qxx - Qxu @ jnp.linalg.inv(Quu) @ jnp.transpose(Qxu, (0, 2, 1)) #num_agents, state_dim, state_dim
+
+    #             feedforward_gain = feedforward_gain.at[:, :, k].set(jnp.squeeze(-jnp.linalg.inv(Quu) @ Qu, -1)) # num_agents, action_dim
+    #             feedback_gain = feedback_gain.at[:, :, :, k].set(-jnp.linalg.inv(Quu) @ jnp.transpose(Qxu, (0, 2, 1))) # num_agents, action_dim, state_dim
+
+    #             # V = Vnext 
+    #             Vx = Vxnext
+    #             Vxx = Vxxnext
+
+    #         x_ref_new = jnp.zeros((self.num_agents, self.state_dim, self.PARAMS["time_horizon"])) # num_agents, state_dim, time_horizon
+    #         x_ref_new = x_ref_new.at[:, :, 0].set(agent)
+    #         # jax.debug.print('Ff_gain:{x}', x=feedforward_gain[:, :, 0])
+    #         for k in range(self.PARAMS["time_horizon"]):
+    #             u_ref = u_ref.at[:, :, k].set(u_ref[:, :, k] + feedforward_gain[:, :, k] + jnp.squeeze(feedback_gain[:, :, :, k] @ jnp.expand_dims(x_ref_new[:, :, k] - x_ref[:, :, k], -1), -1))
+    #             x_ref_new = x_ref_new.at[:, :, k+1].set(self.agent_step_euler(x_ref_new[:, :, k], u_ref[:, :, k]))
+            
+    #         x_ref = x_ref_new
+
+    #     # u_ref = u_ref.at[:, :, k - 1].set(jnp.squeeze(feedforward_gain + feedback_gain @ jnp.expand_dims(x_ref[:, :, k], -1), -1)) # num_agents, action_dim
+    #     # breakpoint()
+    #     lower, upper = jnp.array([-0.5 / 48.0, -0.5 / 48.0, -1.0]), jnp.array([0.5 / 48.0, 0.5 / 48.0, 1.0])
+    #     u_norm = 2.0 * (u_ref[:, :, 0]  - lower) / (upper - lower) - 1.0
+
+    #     # jax.debug.callback(self.save_plot, x_ref_new)
+    #     # jax.debug.print('Action:{x}', x=u_ref)
+    #     # jax.debug.print('State:{x}', x=x_ref)
+    #     return self.clip_action(u_norm)
+    
+    def save_plot(self, x_ref):
+        # breakpoint()
+        x_ref_new = jax.device_get(x_ref)
+        fig, axs = plt.subplots()
+        axs.plot(x_ref_new[0, 0, :].transpose(), x_ref_new[0, 1, :].transpose())
+        fig.savefig('test.png')
     
     def forward_graph(self, graph: GraphsTuple, action: Action) -> GraphsTuple:
         # calculate next graph

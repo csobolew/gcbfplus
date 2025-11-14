@@ -197,6 +197,7 @@ def render_video(
         Ta_is_unsafe=None,
         viz_opts: dict = None,
         dpi: int = 100,
+        trajs=None,
         **kwargs
 ):
     assert dim == 2 or dim == 3
@@ -248,6 +249,13 @@ def render_video(
                        for ii in range(n_agent * 2)]
         agent_col = MutablePatchCollection([i for i in reversed(agent_circs)], match_original=True, zorder=6)
         ax.add_collection(agent_col)
+
+        # --- Initialize trajectory line objects ---
+        traj_lines = []
+        if trajs is not None:
+            for i in range(n_agent):
+                (line,) = ax.plot([], [], color=agent_color, linewidth=2.0, alpha=0.6, zorder=2)
+                traj_lines.append(line)
         
         # Add orientation arrows for agents if state has orientation
         orientation_arrows = []
@@ -423,17 +431,14 @@ def render_video(
                     x, y = n_pos_t[ii, 0], n_pos_t[ii, 1]
                     psi = graph.states[ii, 2]
                     
-                    # Arrow pointing from center in direction of psi
                     arrow_start_x = x - (arrow_length * 0.3) * np.cos(psi)
                     arrow_start_y = y - (arrow_length * 0.3) * np.sin(psi)
                     dx = arrow_length * np.cos(psi)
                     dy = arrow_length * np.sin(psi)
                     
-                    # Remove old arrow
                     if ii < len(orientation_arrows):
                         orientation_arrows[ii].remove()
                     
-                    # Create new arrow
                     arrow = FancyArrow(
                         arrow_start_x, arrow_start_y, dx, dy,
                         width=r * 0.4,
@@ -457,24 +462,21 @@ def render_video(
                     x, y = n_pos_t[goal_idx, 0], n_pos_t[goal_idx, 1]
                     psi = graph.states[goal_idx, 2]
                     
-                    # Arrow pointing from center in direction of psi
                     arrow_start_x = x - (arrow_length * 0.3) * np.cos(psi)
                     arrow_start_y = y - (arrow_length * 0.3) * np.sin(psi)
                     dx = arrow_length * np.cos(psi)
                     dy = arrow_length * np.sin(psi)
                     
-                    # Remove old arrow
                     if ii < len(goal_orientation_arrows):
                         goal_orientation_arrows[ii].remove()
                     
-                    # Create new arrow
                     arrow = FancyArrow(
                         arrow_start_x, arrow_start_y, dx, dy,
                         width=r * 0.4,
                         head_width=r * 1.2,
                         head_length=r * 0.8,
-                        fc='#000000',  # Black arrow for goal
-                        ec='white',    # White edge for contrast
+                        fc='#000000',
+                        ec='white',
                         linewidth=1.0,
                         zorder=9,
                         length_includes_head=True
@@ -487,6 +489,15 @@ def render_video(
         else:
             agent_col.set_offsets(n_pos_t[:n_agent * 2, :2])
             agent_col.set_3d_properties(n_pos_t[:n_agent * 2, 2], zdir='z')
+
+        # --- Update predicted trajectories for each agent ---
+        if trajs is not None and kk < trajs.shape[0]:
+            for ii in range(n_agent):
+                # trajs[kk, ii, 0, :] = x positions
+                # trajs[kk, ii, 1, :] = y positions
+                x_traj = trajs[kk, ii, 0, :]
+                y_traj = trajs[kk, ii, 1, :]
+                traj_lines[ii].set_data(x_traj, y_traj)
 
         # update edges
         e_edge_index_t = np.stack([graph.senders, graph.receivers], axis=0)
@@ -520,7 +531,7 @@ def render_video(
         else:
             safe_text[0].set_text("Unsafe: {}")
 
-        # Update the contourf.
+        # Update the contourf (CBF visualization)
         nonlocal cnt, cnt_line
         if "cbf" in viz_opts and dim == 2:
             for c in cnt.collections:
@@ -538,11 +549,18 @@ def render_video(
 
         kk_text.set_text("kk={:04}".format(kk))
 
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text, *orientation_arrows, *goal_orientation_arrows]
+        return [
+            agent_col, edge_col, *agent_labels,
+            cost_text, *safe_text, *cnt_col_t,
+            kk_text, *orientation_arrows, *goal_orientation_arrows,
+            *traj_lines  # ensure these are redrawn every frame
+        ]
+
 
     fps = 30.0
     spf = 1 / fps
     mspf = 1_000 * spf
     anim_T = len(T_graph.n_node)
+    print(anim_T)
     ani = FuncAnimation(fig, update, frames=anim_T, init_func=init_fn, interval=mspf, blit=True)
     save_anim(ani, video_path)
