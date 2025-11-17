@@ -41,8 +41,8 @@ class QuadrupedAccel(MultiAgentEnv):
         "n_rays": 32,
         "obs_len_range": [1.0/ENV_SIZE, 4.0/ENV_SIZE],
         "n_obs": 1,
-        "time_horizon": 10,
-        "ilqr_iterations": 20,
+        "time_horizon": 50,
+        "ilqr_iterations": 1,
         "action_lower": np.array([-0.75/ENV_SIZE, -0.75/ENV_SIZE, -1.0]),
         "action_upper": np.array([0.75/ENV_SIZE, 0.75/ENV_SIZE, 1.0])
     }
@@ -58,6 +58,8 @@ class QuadrupedAccel(MultiAgentEnv):
     ):
         super(QuadrupedAccel, self).__init__(num_agents, area_size, max_step, max_travel, dt, params)
         self.trajs = []
+        self.prev_u_ref = None
+        self.prev_x_ref = None
         self.create_obstacles = jax_vmap(Rectangle.create)
 
     @property
@@ -389,9 +391,9 @@ class QuadrupedAccel(MultiAgentEnv):
         agent = graph.type_states(type_idx=0, n_type=self.num_agents)
         goal  = graph.type_states(type_idx=1, n_type=self.num_agents)
 
-        Q = jnp.expand_dims(jnp.diag(jnp.array([1,1,0.1,1,1])), 0).repeat(self.num_agents, 0)
-        Qf = jnp.expand_dims(jnp.diag(jnp.array([10,10,1,10,10])), 0).repeat(self.num_agents, 0)
-        R = jnp.expand_dims(jnp.diag(jnp.array([30,30,100])), 0).repeat(self.num_agents, 0)
+        Q = jnp.expand_dims(jnp.diag(jnp.array([10,10,5,5,5])), 0).repeat(self.num_agents, 0)
+        Qf = jnp.expand_dims(jnp.diag(jnp.array([100,100,50,50,50])), 0).repeat(self.num_agents, 0)
+        R = jnp.expand_dims(jnp.diag(jnp.array([30,30,10])), 0).repeat(self.num_agents, 0)
 
         def forward_roll(x, u):
             # JIT these helpers too
@@ -405,7 +407,12 @@ class QuadrupedAccel(MultiAgentEnv):
                 Vx, Vxx = carry_b
                 vx = x_ref[:, 3, k]; vy = x_ref[:, 4, k]; yaw = x_ref[:, 2, k]
 
-                lx  = Q @ (x_ref[:, :, k] - goal)[..., None]
+                state_error = x_ref[:, :, k] - goal
+                angle_error = state_error[:, 2]
+                angle_error = jnp.arctan2(jnp.sin(angle_error), jnp.cos(angle_error))
+                state_error = state_error.at[:, 2].set(angle_error)
+
+                lx  = Q @ state_error[..., None]
                 lu  = R @ u_ref[:, :, k][..., None]
                 lxx = Q
                 luu = R
@@ -446,8 +453,12 @@ class QuadrupedAccel(MultiAgentEnv):
 
                 return (Vx_next, Vxx_next), (k_ff.squeeze(-1), k_fb)  # save gains
 
-            # init at T: Vx=Q(x_T - goal), Vxx=Q
-            Vx_T  = (Qf @ (x_ref[:, :, -1] - goal)[..., None]).astype(jnp.float32)
+            state_error_T = x_ref[:, :, -1] - goal
+            angle_error_T = state_error_T[:, 2]
+            angle_error_T = jnp.arctan2(jnp.sin(angle_error_T), jnp.cos(angle_error_T))
+            state_error_T = state_error_T.at[:, 2].set(angle_error_T)
+
+            Vx_T = (Qf @ state_error_T[..., None]).astype(jnp.float32)
             Vxx_T = Qf.astype(jnp.float32)
             ks, gains = lax.scan(
                 f=bwd_step,
@@ -534,13 +545,46 @@ class QuadrupedAccel(MultiAgentEnv):
 
             return (x_ref_new, u_ref_new), None
 
-        # initialize refs (zeros u, start from agent state)
-        u0 = jnp.zeros((self.num_agents, self.action_dim, self.PARAMS["time_horizon"]))
-        x0 = jnp.zeros((self.num_agents, self.state_dim, self.PARAMS["time_horizon"] + 1))
-        x0 = x0.at[:, :, 0].set(agent)
+        T = self.PARAMS["time_horizon"]
+        N = self.num_agents
+
+        # check if warmstart exists
+        if self.prev_x_ref is None:
+            # cold start (zeros)
+            u0 = jnp.zeros((N, self.action_dim, T))
+            # rollout initial x0 using zero controls
+            def init_rollout(xk, k):
+                xk1 = self.agent_step_euler(xk, jnp.zeros((N, self.action_dim)))
+                return xk1, xk1
+            _, x_traj = lax.scan(init_rollout, agent, jnp.arange(T))
+            x0 = jnp.concatenate([agent[..., None], jnp.transpose(x_traj, (1,2,0))], axis=-1)
+
+        else:
+            # warm start
+            # Shift the previous optimized trajectory/control by 1 step
+            prev_x = self.prev_x_ref
+            prev_u = self.prev_u_ref
+
+            # state warm-start: use prev_x[t+1] → prev_x[1:], pad last with last
+            x0 = jnp.concatenate(
+                [
+                    agent[..., None],
+                    prev_x[:, :, 1:],  # shift
+                ],
+                axis=-1
+            )
+
+            # action warm-start: use prev_u[t+1] → prev_u[1:], pad last with zeros
+            u0 = jnp.concatenate(
+                [
+                    prev_u[:, :, 1:],                    # shifted warm start
+                    jnp.zeros((N, self.action_dim, 1)),  # last control is zero
+                ],
+                axis=-1
+            )
         (x_ref, u_ref), _ = lax.scan(ilqr_iter, (x0, u0), None, length=self.PARAMS["ilqr_iterations"])
-        jax.debug.print("{a}", a=x_ref[:,:3,:])
-        jax.debug.print("done")
+        # jax.debug.print("{a}", a=x_ref[:,:3,:])
+        # jax.debug.print("done")
 
         jax.debug.callback(self.add_traj, x_ref)
         # scale to normalized action space using solve instead of ad-hoc inv
